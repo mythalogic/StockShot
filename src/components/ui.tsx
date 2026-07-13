@@ -57,6 +57,12 @@ export function StatusBadge({ status }: { status: CaptureStatus }) {
         1 of 2 photos
       </span>
     )
+  if (status === 'no_image')
+    return (
+      <span className="inline-flex items-center gap-1 rounded px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide bg-ink/10 text-ink/60">
+        ⊘ No photos
+      </span>
+    )
   return (
     <span className="inline-flex items-center gap-1 rounded px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide bg-ink/5 text-ink/50">
       Not started

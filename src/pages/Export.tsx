@@ -2,13 +2,14 @@ import { useState } from 'react'
 
 import { useData } from '../context/DataContext'
 import { useAuth } from '../context/AuthContext'
-import { statusOf, Capture, Product } from '../lib/supabase'
+import { statusOf, photoFileBase, Capture, Product } from '../lib/supabase'
 
 type ExportMode = 'zip' | 'links' | 'base64'
 
 const STATUS_LABEL: Record<string, string> = {
   done: 'Done',
   partial: 'Partial',
+  no_image: 'No photos available',
   not_started: 'Not started'
 }
 
@@ -116,19 +117,23 @@ export default function ExportPage() {
           i++
           const c = captures.get(p.id)
           setProgress(`Packing images ${i}/${products.length}…`)
+          const base = photoFileBase(p.sku, p.product_name, c?.captured_at ? new Date(c.captured_at) : new Date())
           if (c?.product_photo_url) {
             const b = await fetchImage(c.product_photo_url)
-            if (b) images.file(`${p.sku}_product.jpg`, b)
+            if (b) images.file(`${base}_product.jpg`, b)
           }
           if (c?.barcode_photo_url) {
             const b = await fetchImage(c.barcode_photo_url)
-            if (b) images.file(`${p.sku}_barcode.jpg`, b)
+            if (b) images.file(`${base}_barcode.jpg`, b)
           }
         }
-        const csv = buildRows((p, c) => [
-          c?.product_photo_url ? `images/${p.sku}_product.jpg` : '',
-          c?.barcode_photo_url ? `images/${p.sku}_barcode.jpg` : ''
-        ])
+        const csv = buildRows((p, c) => {
+          const base = photoFileBase(p.sku, p.product_name, c?.captured_at ? new Date(c.captured_at) : new Date())
+          return [
+            c?.product_photo_url ? `images/${base}_product.jpg` : '',
+            c?.barcode_photo_url ? `images/${base}_barcode.jpg` : ''
+          ]
+        })
         zip.file('stockshot_export.csv', csv)
         setProgress('Zipping…')
         const blob = await zip.generateAsync({ type: 'blob' })

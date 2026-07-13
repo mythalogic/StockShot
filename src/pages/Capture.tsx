@@ -3,7 +3,7 @@ import { useNavigate, useParams } from 'react-router-dom'
 import { useData } from '../context/DataContext'
 import { useAuth } from '../context/AuthContext'
 import { useToast } from '../components/ui'
-import { supabase, Capture } from '../lib/supabase'
+import { supabase, Capture, photoFileBase } from '../lib/supabase'
 import { compressImage } from '../lib/image'
 import { tryDecodeBarcode } from '../lib/barcode'
 
@@ -27,11 +27,11 @@ export default function CaptureScreen() {
 
   const [pending, setPending] = useState<Record<Slot, Pending | null>>({ product: null, barcode: null })
   const [saving, setSaving] = useState(false)
+  const [confirmNoPhotos, setConfirmNoPhotos] = useState(false)
   const inputs = { product: useRef<HTMLInputElement>(null), barcode: useRef<HTMLInputElement>(null) }
 
   useEffect(() => {
     return () => {
-      // release object URLs
       Object.values(pending).forEach((p) => p && URL.revokeObjectURL(p.previewUrl))
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -66,34 +66,38 @@ export default function CaptureScreen() {
   const usePhoto = (slot: Slot) =>
     setPending((prev) => (prev[slot] ? { ...prev, [slot]: { ...prev[slot]!, confirmed: true } } : prev))
 
+  const isNoImage = existing?.status === 'no_image'
   const hasProduct = Boolean(pending.product?.confirmed || existing?.product_photo_url)
   const hasBarcode = Boolean(pending.barcode?.confirmed || existing?.barcode_photo_url)
   const anythingNew = Boolean(pending.product?.confirmed || pending.barcode?.confirmed)
   const bothDone = hasProduct && hasBarcode
+  const nothingCapturedYet = !hasProduct && !hasBarcode && !anythingNew
 
   const save = async () => {
     if (!anythingNew || saving) return
     setSaving(true)
     try {
+      const now = new Date()
       let productUrl = existing?.product_photo_url ?? null
       let barcodeUrl = existing?.barcode_photo_url ?? null
       let barcodeValue = existing?.barcode_value ?? null
 
+      // Filenames carry SKU + product name + date/time, e.g.
+      // captures/266/266_EGGS-FILLER-CAGED-BOX-600GM_2026-07-13_19-43_product.jpg
+      const base = photoFileBase(product.sku, product.product_name, now)
       const upload = async (slot: Slot, blob: Blob) => {
-        const path = `captures/${product.sku}/${slot}.jpg`
+        const path = `captures/${product.sku}/${base}_${slot}.jpg`
         const { error } = await supabase.storage
           .from('captures')
           .upload(path, blob, { contentType: 'image/jpeg', upsert: true })
         if (error) throw error
         const { data } = supabase.storage.from('captures').getPublicUrl(path)
-        // Cache-bust so retaken photos refresh in the UI/export
-        return `${data.publicUrl}?v=${Date.now()}`
+        return data.publicUrl
       }
 
       if (pending.product?.confirmed) productUrl = await upload('product', pending.product.blob)
       if (pending.barcode?.confirmed) {
         barcodeUrl = await upload('barcode', pending.barcode.blob)
-        // Bonus: try to decode — never blocks saving
         const decoded = await tryDecodeBarcode(pending.barcode.blob).catch(() => null)
         if (decoded) barcodeValue = decoded
       }
@@ -106,7 +110,7 @@ export default function CaptureScreen() {
           barcode_photo_url: barcodeUrl,
           barcode_value: barcodeValue,
           captured_by: session?.user?.id ?? null,
-          captured_at: new Date().toISOString(),
+          captured_at: now.toISOString(),
           status
         },
         { onConflict: 'product_id' }
@@ -123,8 +127,36 @@ export default function CaptureScreen() {
     }
   }
 
+  const markNoPhotos = async () => {
+    if (saving) return
+    setSaving(true)
+    try {
+      const { error } = await supabase.from('captures').upsert(
+        {
+          product_id: product.id,
+          product_photo_url: null,
+          barcode_photo_url: null,
+          barcode_value: null,
+          captured_by: session?.user?.id ?? null,
+          captured_at: new Date().toISOString(),
+          status: 'no_image'
+        },
+        { onConflict: 'product_id' }
+      )
+      if (error) throw error
+      await refresh()
+      toast('Marked: no photos available')
+      nav('/')
+    } catch (e: any) {
+      toast(`Could not save — ${e?.message ?? 'try again'}`, 'err')
+    } finally {
+      setSaving(false)
+      setConfirmNoPhotos(false)
+    }
+  }
+
   return (
-    <div className="min-h-dvh bg-paper pb-32">
+    <div className="min-h-dvh bg-paper pb-44">
       <header className="sticky top-0 z-30 bg-paper/95 backdrop-blur border-b border-line px-4 pt-3 pb-3" style={{ paddingTop: 'calc(env(safe-area-inset-top) + 12px)' }}>
         <button onClick={() => nav('/')} className="text-sm text-ink/60 mb-1">← Products</button>
         <h1 className="font-display text-2xl font-bold uppercase leading-tight tracking-tight">{product.product_name}</h1>
@@ -132,6 +164,12 @@ export default function CaptureScreen() {
       </header>
 
       <main className="px-4 mt-4 space-y-4">
+        {isNoImage && !anythingNew && (
+          <div className="rounded border border-partial/40 bg-partial/5 p-3 text-sm">
+            This product is marked <strong>no photos available</strong>. Taking a photo below will replace that.
+          </div>
+        )}
+
         <Tile
           title="Product photo"
           hint="Clear shot of the whole product"
@@ -157,9 +195,45 @@ export default function CaptureScreen() {
         {existing?.barcode_value && (
           <p className="font-mono text-sm text-ink/60 px-1">Decoded barcode: {existing.barcode_value}</p>
         )}
+
+        {/* No-photos option — only when nothing has been captured */}
+        {nothingCapturedYet && !isNoImage && (
+          <section className="rounded border border-line bg-white p-4">
+            {confirmNoPhotos ? (
+              <div>
+                <p className="text-sm mb-3">
+                  Mark <strong>{product.product_name}</strong> as having no photos available? It will count as
+                  accounted for in progress and exports.
+                </p>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setConfirmNoPhotos(false)}
+                    className="flex-1 rounded border border-line py-3 text-sm font-semibold"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={markNoPhotos}
+                    disabled={saving}
+                    className="flex-1 rounded bg-partial text-white py-3 text-sm font-semibold disabled:opacity-40"
+                  >
+                    {saving ? 'Saving…' : 'Yes, no photos'}
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <button
+                onClick={() => setConfirmNoPhotos(true)}
+                className="w-full rounded border border-line py-3 text-sm font-semibold text-ink/60"
+              >
+                No photos available for this product
+              </button>
+            )}
+          </section>
+        )}
       </main>
 
-      {/* Save bar */}
+      {/* Save bar — bottom nav is hidden on this screen so this is always fully visible */}
       <div className="fixed bottom-0 inset-x-0 z-40 bg-white border-t border-line p-4" style={{ paddingBottom: 'calc(env(safe-area-inset-bottom) + 16px)' }}>
         <div className="flex items-center justify-between mb-2 text-sm">
           <span className={hasProduct ? 'text-done font-semibold' : 'text-ink/40'}>
@@ -172,9 +246,9 @@ export default function CaptureScreen() {
         <button
           onClick={save}
           disabled={!anythingNew || saving}
-          className={`w-full rounded py-4 text-base font-semibold text-white disabled:opacity-35 ${bothDone ? 'bg-done' : 'bg-ink'}`}
+          className={`w-full rounded py-4 text-lg font-bold text-white disabled:opacity-35 ${bothDone ? 'bg-done' : 'bg-ink'}`}
         >
-          {saving ? 'Uploading…' : bothDone ? 'Save — both photos done' : 'Save'}
+          {saving ? 'Uploading…' : bothDone ? '✓ Save — both photos done' : 'Save'}
         </button>
       </div>
     </div>
@@ -205,7 +279,6 @@ function Tile(props: {
         )}
       </div>
 
-      {/* Native camera input — most reliable inside installed PWAs on iOS */}
       <input
         ref={inputRef}
         type="file"
@@ -219,25 +292,27 @@ function Tile(props: {
         <div>
           <img src={showPreview} alt={`${title} preview`} className="w-full max-h-72 object-contain bg-ink/5" />
           <div className="flex gap-2 p-3">
-            <button
-              onClick={() => onRetake(slot)}
-              className="flex-1 rounded border border-line py-3 text-sm font-semibold"
-            >
-              Retake
-            </button>
             {pending && !pending.confirmed ? (
-              <button
-                onClick={() => onUse(slot)}
-                className="flex-1 rounded bg-ink text-white py-3 text-sm font-semibold"
-              >
-                Use photo
-              </button>
+              <>
+                <button
+                  onClick={() => onRetake(slot)}
+                  className="flex-1 rounded border border-line py-3 text-sm font-semibold"
+                >
+                  Retake
+                </button>
+                <button
+                  onClick={() => onUse(slot)}
+                  className="flex-1 rounded bg-ink text-white py-3 text-sm font-semibold"
+                >
+                  Use photo
+                </button>
+              </>
             ) : (
               <button
-                onClick={() => inputRef.current?.click()}
-                className="flex-1 rounded border border-line py-3 text-sm font-semibold text-ink/60"
+                onClick={() => onRetake(slot)}
+                className="flex-1 rounded border border-line py-3 text-sm font-semibold"
               >
-                Take again
+                Retake
               </button>
             )}
           </div>
