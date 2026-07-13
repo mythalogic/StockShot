@@ -61,7 +61,7 @@ create table if not exists public.captures (
   captured_by uuid references auth.users (id),
   captured_at timestamptz not null default now(),
   status text not null default 'not_started'
-    check (status in ('not_started', 'partial', 'done'))
+    check (status in ('not_started', 'partial', 'done', 'no_image'))
 );
 
 -- ---------- App settings (export restriction toggle) ----------
@@ -157,3 +157,8 @@ create policy "captures bucket update"
 --   update public.profiles set role = 'manager'
 --   where email = 'you@example.com';
 -- ============================================================
+
+drop policy if exists "captures bucket delete" on storage.objects;
+create policy "captures bucket delete"
+  on storage.objects for delete to authenticated
+  using (bucket_id = 'captures');

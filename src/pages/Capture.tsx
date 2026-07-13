@@ -155,6 +155,54 @@ export default function CaptureScreen() {
     }
   }
 
+  const deletePhoto = async (slot: Slot) => {
+    if (saving) return
+    // If it's only a local (unsaved) photo, just discard it.
+    if (pending[slot]) {
+      setPending((prev) => {
+        if (prev[slot]) URL.revokeObjectURL(prev[slot]!.previewUrl)
+        return { ...prev, [slot]: null }
+      })
+      return
+    }
+    if (!existing) return
+    setSaving(true)
+    try {
+      const url = slot === 'product' ? existing.product_photo_url : existing.barcode_photo_url
+      // Best effort: remove the file from storage (path is everything after /captures/)
+      if (url) {
+        const marker = '/object/public/captures/'
+        const idx = url.indexOf(marker)
+        if (idx !== -1) {
+          const path = decodeURIComponent(url.slice(idx + marker.length).split('?')[0])
+          await supabase.storage.from('captures').remove([path]).catch(() => null)
+        }
+      }
+      const productUrl = slot === 'product' ? null : existing.product_photo_url
+      const barcodeUrl = slot === 'barcode' ? null : existing.barcode_photo_url
+      const status = productUrl && barcodeUrl ? 'done' : productUrl || barcodeUrl ? 'partial' : 'not_started'
+      const { error } = await supabase.from('captures').upsert(
+        {
+          product_id: product.id,
+          product_photo_url: productUrl,
+          barcode_photo_url: barcodeUrl,
+          barcode_value: slot === 'barcode' ? null : existing.barcode_value,
+          captured_by: session?.user?.id ?? null,
+          captured_at: new Date().toISOString(),
+          status
+        },
+        { onConflict: 'product_id' }
+      )
+      if (error) throw error
+      await refresh()
+      toast(slot === 'product' ? 'Product photo deleted' : 'Barcode photo deleted')
+    } catch (e: any) {
+      toast(`Delete failed — ${e?.message ?? 'try again'}`, 'err')
+    } finally {
+      setSaving(false)
+    }
+  }
+
   return (
     <div className="min-h-dvh bg-paper pb-44">
       <header className="sticky top-0 z-30 bg-paper/95 backdrop-blur border-b border-line px-4 pt-3 pb-3" style={{ paddingTop: 'calc(env(safe-area-inset-top) + 12px)' }}>
@@ -180,6 +228,7 @@ export default function CaptureScreen() {
           onPick={onPick}
           onRetake={retake}
           onUse={usePhoto}
+          onDelete={deletePhoto}
         />
         <Tile
           title="Barcode photo"
@@ -191,6 +240,7 @@ export default function CaptureScreen() {
           onPick={onPick}
           onRetake={retake}
           onUse={usePhoto}
+          onDelete={deletePhoto}
         />
         {existing?.barcode_value && (
           <p className="font-mono text-sm text-ink/60 px-1">Decoded barcode: {existing.barcode_value}</p>
@@ -265,9 +315,11 @@ function Tile(props: {
   onPick: (slot: Slot, f: File | undefined) => void
   onRetake: (slot: Slot) => void
   onUse: (slot: Slot) => void
+  onDelete: (slot: Slot) => void
 }) {
-  const { title, hint, slot, pending, existingUrl, inputRef, onPick, onRetake, onUse } = props
+  const { title, hint, slot, pending, existingUrl, inputRef, onPick, onRetake, onUse, onDelete } = props
   const showPreview = pending?.previewUrl ?? existingUrl
+  const [confirmDelete, setConfirmDelete] = useState(false)
 
   return (
     <section className="rounded border border-line bg-white overflow-hidden">
@@ -307,13 +359,39 @@ function Tile(props: {
                   Use photo
                 </button>
               </>
+            ) : confirmDelete ? (
+              <>
+                <button
+                  onClick={() => setConfirmDelete(false)}
+                  className="flex-1 rounded border border-line py-3 text-sm font-semibold"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => {
+                    setConfirmDelete(false)
+                    onDelete(slot)
+                  }}
+                  className="flex-1 rounded bg-scan text-white py-3 text-sm font-semibold"
+                >
+                  Yes, delete photo
+                </button>
+              </>
             ) : (
-              <button
-                onClick={() => onRetake(slot)}
-                className="flex-1 rounded border border-line py-3 text-sm font-semibold"
-              >
-                Retake
-              </button>
+              <>
+                <button
+                  onClick={() => onRetake(slot)}
+                  className="flex-1 rounded border border-line py-3 text-sm font-semibold"
+                >
+                  Retake
+                </button>
+                <button
+                  onClick={() => setConfirmDelete(true)}
+                  className="flex-1 rounded border border-scan/50 py-3 text-sm font-semibold text-scan"
+                >
+                  Delete
+                </button>
+              </>
             )}
           </div>
         </div>
