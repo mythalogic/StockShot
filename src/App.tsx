@@ -1,3 +1,4 @@
+import { useEffect } from 'react'
 import { Routes, Route, Navigate, useLocation } from 'react-router-dom'
 import { AuthProvider, useAuth } from './context/AuthContext'
 import { DataProvider } from './context/DataContext'
@@ -14,13 +15,24 @@ import { warmUpSegmenter } from './lib/segmentation'
 function Shell() {
   const { session, loading, isManager } = useAuth()
   const location = useLocation()
+
   // Hide the bottom nav on the capture screen so the Save bar
   // is always fully visible and easy to press.
   const hideNav = location.pathname.startsWith('/capture/')
 
+  // Load and compile the background-removal model once, in the background,
+  // as soon as someone signs in. Without this the first capture of the day
+  // pays a 1-2 second compile cost on top of its own processing time.
+  //
+  // Must stay above the early returns below: React runs hooks in the same
+  // order on every render, and a hook after a conditional return breaks that.
+  //
+  // Failure is swallowed on purpose. If the model can't load, sign-in must
+  // still work — processProductPhoto retries and falls back to saving the
+  // photo uncut rather than blocking the stocktake.
   useEffect(() => {
-  if (session) void warmUpSegmenter().catch(() => {}) // best-effort; capture retries
-                  }, [session]) 
+    if (session) void warmUpSegmenter().catch(() => {})
+  }, [session])
 
   if (loading) {
     return (
