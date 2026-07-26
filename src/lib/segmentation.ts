@@ -51,26 +51,37 @@ export function configureSegmenter(next: Partial<SegmenterConfig>): void {
  * so the first capture isn't the one that pays the ~1-2s compile cost.
  */
 export function warmUpSegmenter(): Promise<ort.InferenceSession> {
-  if (!sessionPromise) {
-    ort.env.wasm.wasmPaths = config.wasmPath
+  if (sessionPromise) return sessionPromise
 
-    // Multi-threading needs cross-origin isolation (COOP/COEP headers). Most
-    // static hosts don't set those, and asking for threads without them makes
-    // onnxruntime fail rather than fall back — so only ask when we know we can.
-    ort.env.wasm.numThreads =
-      typeof crossOriginIsolated !== 'undefined' && crossOriginIsolated
-        ? Math.min(4, navigator.hardwareConcurrency || 2)
-        : 1
+  ort.env.wasm.wasmPaths = config.wasmPath
 
-    sessionPromise = ort.InferenceSession.create(config.modelUrl, {
+  // Multi-threading needs cross-origin isolation (COOP/COEP headers). Most
+  // static hosts don't set those, and asking for threads without them makes
+  // onnxruntime fail rather than fall back — so only ask when we know we can.
+  ort.env.wasm.numThreads =
+    typeof crossOriginIsolated !== 'undefined' && crossOriginIsolated
+      ? Math.min(4, navigator.hardwareConcurrency || 2)
+      : 1
+
+  // Held in a local first. Assigning straight to the module-level variable and
+  // returning it doesn't typecheck: the .catch callback below also writes to
+  // `sessionPromise`, and TypeScript drops the not-null narrowing for any
+  // variable a closure can reassign.
+  const started: Promise<ort.InferenceSession> = ort.InferenceSession.create(
+    config.modelUrl,
+    {
       executionProviders: ['wasm'],
       graphOptimizationLevel: 'all',
-    }).catch((e) => {
-      sessionPromise = null // let the next attempt retry rather than cache the failure
-      throw e
-    })
-  }
-  return sessionPromise
+    },
+  ).catch((e: unknown) => {
+    // Clear the cache so the next capture retries, but only if nothing has
+    // reconfigured the segmenter in the meantime.
+    if (sessionPromise === started) sessionPromise = null
+    throw e
+  })
+
+  sessionPromise = started
+  return started
 }
 
 export interface CutOutOptions {
