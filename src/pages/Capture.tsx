@@ -4,18 +4,32 @@ import { useData } from '../context/DataContext'
 import { useAuth } from '../context/AuthContext'
 import { useToast } from '../components/ui'
 import { supabase, Capture, photoFileBase } from '../lib/supabase'
-import { compressImage } from '../lib/image'
-import { tryDecodeBarcode } from '../lib/barcode'
 import { processProductPhoto } from '../lib/productImage'
 import { processBarcodePhoto, generateBarcodeForSku } from '../lib/barcodeImage'
 import type { BarcodeResult } from '../lib/barcodeImage'
 
 type Slot = 'product' | 'barcode'
 
+// The columns added by migration 002. Declared here so this file compiles
+// without touching the Capture type in lib/supabase.ts — move them into that
+// interface when you get a chance and this alias can go away.
+type CaptureRow = Capture & {
+  barcode_format?: string | null
+  barcode_source?: string | null
+  product_photo_processed?: boolean | null
+}
+
 interface Pending {
   blob: Blob
   previewUrl: string
   confirmed: boolean
+  /** Barcodes come out as PNG (line art), product shots as JPEG. */
+  ext: 'jpg' | 'png'
+  contentType: string
+  /** Product slot: set when the cut-out failed and we kept the raw photo. */
+  warning?: string
+  /** Barcode slot: what we actually decoded or minted. */
+  barcode?: BarcodeResult
 }
 
 export default function CaptureScreen() {
@@ -26,22 +40,28 @@ export default function CaptureScreen() {
   const { toast } = useToast()
 
   const product = products.find((p) => p.id === productId)
-  const existing: Capture | undefined = productId ? captures.get(productId) : undefined
+  const existing = (productId ? captures.get(productId) : undefined) as CaptureRow | undefined
 
   const [pending, setPending] = useState<Record<Slot, Pending | null>>({ product: null, barcode: null })
   const [saving, setSaving] = useState(false)
+  const [processing, setProcessing] = useState<Slot | null>(null)
   const [confirmNoPhotos, setConfirmNoPhotos] = useState(false)
   const inputs = { product: useRef<HTMLInputElement>(null), barcode: useRef<HTMLInputElement>(null) }
-  const [processing, setProcessing] = useState<null | 'product' | 'barcode'>(null)
-  const [processedProduct, setProcessedProduct] = useState<Blob | null>(null)
-  const [productWarning, setProductWarning] = useState<string | null>(null)
-  const [barcode, setBarcode] = useState<BarcodeResult | null>(null)
+
+  // Every object URL we hand out, so none leak. The previous version captured
+  // `pending` in an effect with an empty dependency array, which meant it only
+  // ever saw the initial nulls and revoked nothing.
+  const objectUrls = useRef<string[]>([])
+  const trackUrl = (url: string) => {
+    objectUrls.current.push(url)
+    return url
+  }
 
   useEffect(() => {
     return () => {
-      Object.values(pending).forEach((p) => p && URL.revokeObjectURL(p.previewUrl))
+      objectUrls.current.forEach((u) => URL.revokeObjectURL(u))
+      objectUrls.current = []
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   if (!product) {
@@ -52,62 +72,78 @@ export default function CaptureScreen() {
     )
   }
 
-  async function acceptProductPhoto(file: File) {
-  setProcessing('product')
-  setProductWarning(null)
-  try {
-    const result = await processProductPhoto(file)
-    setProcessedProduct(result.blob)
-    setProductPreview(URL.createObjectURL(result.blob)) // your existing preview state
-    if (!result.processed) {
-      setProductWarning(
-        "Couldn't remove the background — saving the photo as-is. Flagged for review.",
-      )
-    }
-  } 
-  finally {
-    setProcessing(null)
-          }
-      }
-
-  async function acceptBarcodePhoto(file: File) {
-  setProcessing('barcode')
-  try {
-    const result = await processBarcodePhoto(file, product.sku)
-    setBarcode(result)
-    setBarcodePreview(URL.createObjectURL(result.blob))
-  } 
-  finally {
-    setProcessing(null)
-          }
-      }
-
-
-  {barcode?.source === 'scanned' && (
-  <p className="font-mono text-xs text-ink/60">✓ {barcode.value}</p>
-)}
-{barcode?.source === 'photo' && (
-  <p className="font-mono text-xs text-amber-700">
-    Couldn't read the barcode — kept the photo. Try again with the pack flat and
-    the whole code in frame.
-  </p>
-)}
-
-  const onPick = async (slot: Slot, file: File | undefined) => {
-    if (!file) return
-    const blob = await compressImage(file)
-    const previewUrl = URL.createObjectURL(blob)
+  const replacePending = (slot: Slot, next: Pending | null) => {
     setPending((prev) => {
       if (prev[slot]) URL.revokeObjectURL(prev[slot]!.previewUrl)
-      return { ...prev, [slot]: { blob, previewUrl, confirmed: false } }
+      return { ...prev, [slot]: next }
     })
   }
 
+  /**
+   * The camera handed us a file. Process it straight away so the preview the
+   * user approves is the image we're actually going to store — if the cut-out
+   * clipped a corner they can retake now, rather than finding out in the export
+   * next week.
+   */
+  const onPick = async (slot: Slot, file: File | undefined) => {
+    if (!file || processing) return
+    setProcessing(slot)
+    try {
+      if (slot === 'product') {
+        const result = await processProductPhoto(file)
+        replacePending('product', {
+          blob: result.blob,
+          previewUrl: trackUrl(URL.createObjectURL(result.blob)),
+          confirmed: false,
+          ext: 'jpg',
+          contentType: 'image/jpeg',
+          warning: result.processed
+            ? undefined
+            : "Couldn't remove the background — keeping the photo as-is, flagged for review."
+        })
+      } else {
+        const result = await processBarcodePhoto(file, product.sku)
+        const isPng = result.source !== 'photo'
+        replacePending('barcode', {
+          blob: result.blob,
+          previewUrl: trackUrl(URL.createObjectURL(result.blob)),
+          confirmed: false,
+          ext: isPng ? 'png' : 'jpg',
+          contentType: isPng ? 'image/png' : 'image/jpeg',
+          barcode: result
+        })
+      }
+    } catch (e: any) {
+      toast(`Couldn't process that photo — ${e?.message ?? 'try again'}`, 'err')
+    } finally {
+      setProcessing(null)
+    }
+  }
+
+  /** Pack carries no barcode: mint a Code 128 from the SKU instead. */
+  const generateBarcode = async () => {
+    if (processing || saving) return
+    setProcessing('barcode')
+    try {
+      const result = await generateBarcodeForSku(product.sku)
+      replacePending('barcode', {
+        blob: result.blob,
+        previewUrl: trackUrl(URL.createObjectURL(result.blob)),
+        confirmed: true, // nothing to approve — there was no photo
+        ext: 'png',
+        contentType: 'image/png',
+        barcode: result
+      })
+      toast('Barcode generated from SKU — press Save to store it')
+    } catch (e: any) {
+      toast(`Couldn't generate a barcode — ${e?.message ?? 'try again'}`, 'err')
+    } finally {
+      setProcessing(null)
+    }
+  }
+
   const retake = (slot: Slot) => {
-    setPending((prev) => {
-      if (prev[slot]) URL.revokeObjectURL(prev[slot]!.previewUrl)
-      return { ...prev, [slot]: null }
-    })
+    replacePending(slot, null)
     inputs[slot].current?.click()
   }
 
@@ -129,25 +165,38 @@ export default function CaptureScreen() {
       let productUrl = existing?.product_photo_url ?? null
       let barcodeUrl = existing?.barcode_photo_url ?? null
       let barcodeValue = existing?.barcode_value ?? null
+      let barcodeFormat = existing?.barcode_format ?? null
+      let barcodeSource = existing?.barcode_source ?? null
+      let productProcessed = existing?.product_photo_processed ?? true
 
       // Filenames carry SKU + product name + date/time, e.g.
       // captures/266/266_EGGS-FILLER-CAGED-BOX-600GM_2026-07-13_19-43_product.jpg
       const base = photoFileBase(product.sku, product.product_name, now)
-      const upload = async (slot: Slot, blob: Blob) => {
-        const path = `captures/${product.sku}/${base}_${slot}.jpg`
+
+      // Extension and content type come from the slot now: a scanned or
+      // generated barcode is a PNG, because JPEG ringing around the bars is
+      // exactly what makes scanners fail.
+      const upload = async (slot: Slot, p: Pending) => {
+        const path = `captures/${product.sku}/${base}_${slot}.${p.ext}`
         const { error } = await supabase.storage
           .from('captures')
-          .upload(path, blob, { contentType: 'image/jpeg', upsert: true })
+          .upload(path, p.blob, { contentType: p.contentType, upsert: true })
         if (error) throw error
         const { data } = supabase.storage.from('captures').getPublicUrl(path)
         return data.publicUrl
       }
 
-      if (pending.product?.confirmed) productUrl = await upload('product', pending.product.blob)
+      if (pending.product?.confirmed) {
+        productUrl = await upload('product', pending.product)
+        productProcessed = !pending.product.warning
+      }
+
       if (pending.barcode?.confirmed) {
-        barcodeUrl = await upload('barcode', pending.barcode.blob)
-        const decoded = await tryDecodeBarcode(pending.barcode.blob).catch(() => null)
-        if (decoded) barcodeValue = decoded
+        barcodeUrl = await upload('barcode', pending.barcode)
+        // processBarcodePhoto already decoded it — no second decode pass needed.
+        barcodeValue = pending.barcode.barcode?.value ?? null
+        barcodeFormat = pending.barcode.barcode?.format ?? null
+        barcodeSource = pending.barcode.barcode?.source ?? null
       }
 
       const status = productUrl && barcodeUrl ? 'done' : 'partial'
@@ -157,6 +206,9 @@ export default function CaptureScreen() {
           product_photo_url: productUrl,
           barcode_photo_url: barcodeUrl,
           barcode_value: barcodeValue,
+          barcode_format: barcodeFormat,
+          barcode_source: barcodeSource,
+          product_photo_processed: productProcessed,
           captured_by: session?.user?.id ?? null,
           captured_at: now.toISOString(),
           status
@@ -185,6 +237,9 @@ export default function CaptureScreen() {
           product_photo_url: null,
           barcode_photo_url: null,
           barcode_value: null,
+          barcode_format: null,
+          barcode_source: null,
+          product_photo_processed: true,
           captured_by: session?.user?.id ?? null,
           captured_at: new Date().toISOString(),
           status: 'no_image'
@@ -203,34 +258,16 @@ export default function CaptureScreen() {
     }
   }
 
-  // product photo — .jpg, as before
-await supabase.storage
-  .from('captures')
-  .upload(`${product.sku}/product.jpg`, processedProduct!, {
-    upsert: true,
-    contentType: 'image/jpeg',
-  })
-
-// barcode — now a PNG when scanned or generated (line art; JPEG ringing around
-// the bars is what makes scanners fail), JPEG only on the photo fallback
-const isPng = barcode!.source !== 'photo'
-const barcodePath = `${product.sku}/barcode.${isPng ? 'png' : 'jpg'}`
-await supabase.storage.from('captures').upload(barcodePath, barcode!.blob, {
-  upsert: true,
-  contentType: isPng ? 'image/png' : 'image/jpeg',
-})
-
   const deletePhoto = async (slot: Slot) => {
     if (saving) return
+
     // If it's only a local (unsaved) photo, just discard it.
     if (pending[slot]) {
-      setPending((prev) => {
-        if (prev[slot]) URL.revokeObjectURL(prev[slot]!.previewUrl)
-        return { ...prev, [slot]: null }
-      })
+      replacePending(slot, null)
       return
     }
     if (!existing) return
+
     setSaving(true)
     try {
       const url = slot === 'product' ? existing.product_photo_url : existing.barcode_photo_url
@@ -243,15 +280,22 @@ await supabase.storage.from('captures').upload(barcodePath, barcode!.blob, {
           await supabase.storage.from('captures').remove([path]).catch(() => null)
         }
       }
+
       const productUrl = slot === 'product' ? null : existing.product_photo_url
       const barcodeUrl = slot === 'barcode' ? null : existing.barcode_photo_url
       const status = productUrl && barcodeUrl ? 'done' : productUrl || barcodeUrl ? 'partial' : 'not_started'
+
       const { error } = await supabase.from('captures').upsert(
         {
           product_id: product.id,
           product_photo_url: productUrl,
           barcode_photo_url: barcodeUrl,
+          // Clearing the barcode image must clear its provenance too, or the
+          // row claims a scanned code it no longer has an image for.
           barcode_value: slot === 'barcode' ? null : existing.barcode_value,
+          barcode_format: slot === 'barcode' ? null : (existing.barcode_format ?? null),
+          barcode_source: slot === 'barcode' ? null : (existing.barcode_source ?? null),
+          product_photo_processed: slot === 'product' ? true : (existing.product_photo_processed ?? true),
           captured_by: session?.user?.id ?? null,
           captured_at: new Date().toISOString(),
           status
@@ -259,6 +303,7 @@ await supabase.storage.from('captures').upload(barcodePath, barcode!.blob, {
         { onConflict: 'product_id' }
       )
       if (error) throw error
+
       await refresh()
       toast(slot === 'product' ? 'Product photo deleted' : 'Barcode photo deleted')
     } catch (e: any) {
@@ -268,9 +313,14 @@ await supabase.storage.from('captures').upload(barcodePath, barcode!.blob, {
     }
   }
 
+  const barcodeResult = pending.barcode?.barcode
+
   return (
     <div className="min-h-dvh bg-paper pb-44">
-      <header className="sticky top-0 z-30 bg-paper/95 backdrop-blur border-b border-line px-4 pt-3 pb-3" style={{ paddingTop: 'calc(env(safe-area-inset-top) + 12px)' }}>
+      <header
+        className="sticky top-0 z-30 bg-paper/95 backdrop-blur border-b border-line px-4 pt-3 pb-3"
+        style={{ paddingTop: 'calc(env(safe-area-inset-top) + 12px)' }}
+      >
         <button onClick={() => nav('/')} className="text-sm text-ink/60 mb-1">← Products</button>
         <h1 className="font-display text-2xl font-bold uppercase leading-tight tracking-tight">{product.product_name}</h1>
         <p className="font-mono text-sm text-ink/60 mt-0.5">{product.sku} · {product.supplier}</p>
@@ -290,11 +340,18 @@ await supabase.storage.from('captures').upload(barcodePath, barcode!.blob, {
           pending={pending.product}
           existingUrl={existing?.product_photo_url ?? null}
           inputRef={inputs.product}
+          busy={processing === 'product'}
+          busyLabel="Removing background…"
           onPick={onPick}
           onRetake={retake}
           onUse={usePhoto}
           onDelete={deletePhoto}
         />
+
+        {pending.product?.warning && (
+          <p className="font-mono text-xs text-amber-700 px-1 -mt-2">{pending.product.warning}</p>
+        )}
+
         <Tile
           title="Barcode photo"
           hint="In focus, well lit, fills the frame"
@@ -302,12 +359,41 @@ await supabase.storage.from('captures').upload(barcodePath, barcode!.blob, {
           pending={pending.barcode}
           existingUrl={existing?.barcode_photo_url ?? null}
           inputRef={inputs.barcode}
+          busy={processing === 'barcode'}
+          busyLabel="Reading barcode…"
           onPick={onPick}
           onRetake={retake}
           onUse={usePhoto}
           onDelete={deletePhoto}
         />
-        {existing?.barcode_value && (
+
+        {barcodeResult?.source === 'scanned' && (
+          <p className="font-mono text-xs text-done px-1 -mt-2">✓ Scanned {barcodeResult.value}</p>
+        )}
+        {barcodeResult?.source === 'generated' && (
+          <p className="font-mono text-xs text-ink/60 px-1 -mt-2">
+            Generated from SKU — {barcodeResult.value}
+          </p>
+        )}
+        {barcodeResult?.source === 'photo' && (
+          <p className="font-mono text-xs text-amber-700 px-1 -mt-2">
+            Couldn't read the barcode — kept the photo. Try again with the pack flat and the whole code in frame.
+          </p>
+        )}
+
+        {/* Packs with no barcode printed on them at all */}
+        {!pending.barcode && !existing?.barcode_photo_url && (
+          <button
+            type="button"
+            onClick={generateBarcode}
+            disabled={processing !== null || saving}
+            className="w-full rounded border border-line py-3 font-mono text-xs text-ink/60 disabled:opacity-40"
+          >
+            No barcode on this pack — generate one from the SKU
+          </button>
+        )}
+
+        {!pending.barcode && existing?.barcode_value && (
           <p className="font-mono text-sm text-ink/60 px-1">Decoded barcode: {existing.barcode_value}</p>
         )}
 
@@ -348,23 +434,11 @@ await supabase.storage.from('captures').upload(barcodePath, barcode!.blob, {
         )}
       </main>
 
-      <button
-  type="button"
-  onClick={async () => setBarcode(await generateBarcodeForSku(product.sku))}
-  className="font-mono text-xs underline text-ink/60"
-      >
-  No barcode on this pack — generate one
-      </button>
-      {
-  // ...what you already send...
-  barcode_value: barcode?.value ?? null,
-  barcode_format: barcode?.format ?? null,
-  barcode_source: barcode?.source ?? null,
-  product_photo_processed: !productWarning,
-}
-
       {/* Save bar — bottom nav is hidden on this screen so this is always fully visible */}
-      <div className="fixed bottom-0 inset-x-0 z-40 bg-white border-t border-line p-4" style={{ paddingBottom: 'calc(env(safe-area-inset-bottom) + 16px)' }}>
+      <div
+        className="fixed bottom-0 inset-x-0 z-40 bg-white border-t border-line p-4"
+        style={{ paddingBottom: 'calc(env(safe-area-inset-bottom) + 16px)' }}
+      >
         <div className="flex items-center justify-between mb-2 text-sm">
           <span className={hasProduct ? 'text-done font-semibold' : 'text-ink/40'}>
             {hasProduct ? '✓ Product photo' : '○ Product photo'}
@@ -375,10 +449,10 @@ await supabase.storage.from('captures').upload(barcodePath, barcode!.blob, {
         </div>
         <button
           onClick={save}
-          disabled={!anythingNew || saving}
+          disabled={!anythingNew || saving || processing !== null}
           className={`w-full rounded py-4 text-lg font-bold text-white disabled:opacity-35 ${bothDone ? 'bg-done' : 'bg-ink'}`}
         >
-          {saving ? 'Uploading…' : bothDone ? '✓ Save — both photos done' : 'Save'}
+          {saving ? 'Uploading…' : processing ? 'Processing…' : bothDone ? '✓ Save — both photos done' : 'Save'}
         </button>
       </div>
     </div>
@@ -392,12 +466,14 @@ function Tile(props: {
   pending: Pending | null
   existingUrl: string | null
   inputRef: React.RefObject<HTMLInputElement>
+  busy: boolean
+  busyLabel: string
   onPick: (slot: Slot, f: File | undefined) => void
   onRetake: (slot: Slot) => void
   onUse: (slot: Slot) => void
   onDelete: (slot: Slot) => void
 }) {
-  const { title, hint, slot, pending, existingUrl, inputRef, onPick, onRetake, onUse, onDelete } = props
+  const { title, hint, slot, pending, existingUrl, inputRef, busy, busyLabel, onPick, onRetake, onUse, onDelete } = props
   const showPreview = pending?.previewUrl ?? existingUrl
   const [confirmDelete, setConfirmDelete] = useState(false)
 
@@ -405,8 +481,11 @@ function Tile(props: {
     <section className="rounded border border-line bg-white overflow-hidden">
       <div className="px-4 pt-3 pb-2 flex items-baseline justify-between">
         <h2 className="font-display text-lg font-bold uppercase tracking-tight">{title}</h2>
-        {pending && !pending.confirmed && <span className="text-xs text-partial font-semibold uppercase">Preview</span>}
-        {(pending?.confirmed || (!pending && existingUrl)) && (
+        {busy && <span className="text-xs text-partial font-semibold uppercase">Working…</span>}
+        {!busy && pending && !pending.confirmed && (
+          <span className="text-xs text-partial font-semibold uppercase">Preview</span>
+        )}
+        {!busy && (pending?.confirmed || (!pending && existingUrl)) && (
           <span className="text-xs text-done font-semibold uppercase">✓ Ready</span>
         )}
       </div>
@@ -417,11 +496,23 @@ function Tile(props: {
         accept="image/*"
         capture="environment"
         className="hidden"
-        onChange={(e) => onPick(slot, e.target.files?.[0])}
+        onChange={(e) => {
+          onPick(slot, e.target.files?.[0])
+          // Let the same file be picked again after a retake — without this,
+          // re-selecting an identical file fires no change event.
+          e.target.value = ''
+        }}
       />
 
-      {showPreview ? (
+      {busy ? (
+        <div className="flex flex-col items-center justify-center gap-2 py-14 text-ink/50">
+          <span className="h-6 w-6 rounded-full border-2 border-ink/20 border-t-ink animate-spin" />
+          <span className="text-sm font-semibold">{busyLabel}</span>
+          <span className="text-xs">A couple of seconds</span>
+        </div>
+      ) : showPreview ? (
         <div>
+          {/* Checkerboard-free: cut-outs are already flattened onto white */}
           <img src={showPreview} alt={`${title} preview`} className="w-full max-h-72 object-contain bg-ink/5" />
           <div className="flex gap-2 p-3">
             {pending && !pending.confirmed ? (
