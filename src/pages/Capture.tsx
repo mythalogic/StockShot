@@ -6,6 +6,9 @@ import { useToast } from '../components/ui'
 import { supabase, Capture, photoFileBase } from '../lib/supabase'
 import { compressImage } from '../lib/image'
 import { tryDecodeBarcode } from '../lib/barcode'
+import { processProductPhoto } from '../lib/productImage'
+import { processBarcodePhoto, generateBarcodeForSku } from '../lib/barcodeImage'
+import type { BarcodeResult } from '../lib/barcodeImage'
 
 type Slot = 'product' | 'barcode'
 
@@ -29,6 +32,10 @@ export default function CaptureScreen() {
   const [saving, setSaving] = useState(false)
   const [confirmNoPhotos, setConfirmNoPhotos] = useState(false)
   const inputs = { product: useRef<HTMLInputElement>(null), barcode: useRef<HTMLInputElement>(null) }
+  const [processing, setProcessing] = useState<null | 'product' | 'barcode'>(null)
+  const [processedProduct, setProcessedProduct] = useState<Blob | null>(null)
+  const [productWarning, setProductWarning] = useState<string | null>(null)
+  const [barcode, setBarcode] = useState<BarcodeResult | null>(null)
 
   useEffect(() => {
     return () => {
@@ -44,6 +51,47 @@ export default function CaptureScreen() {
       </div>
     )
   }
+
+  async function acceptProductPhoto(file: File) {
+  setProcessing('product')
+  setProductWarning(null)
+  try {
+    const result = await processProductPhoto(file)
+    setProcessedProduct(result.blob)
+    setProductPreview(URL.createObjectURL(result.blob)) // your existing preview state
+    if (!result.processed) {
+      setProductWarning(
+        "Couldn't remove the background — saving the photo as-is. Flagged for review.",
+      )
+    }
+  } 
+  finally {
+    setProcessing(null)
+          }
+      }
+
+  async function acceptBarcodePhoto(file: File) {
+  setProcessing('barcode')
+  try {
+    const result = await processBarcodePhoto(file, product.sku)
+    setBarcode(result)
+    setBarcodePreview(URL.createObjectURL(result.blob))
+  } 
+  finally {
+    setProcessing(null)
+          }
+      }
+
+
+  {barcode?.source === 'scanned' && (
+  <p className="font-mono text-xs text-ink/60">✓ {barcode.value}</p>
+)}
+{barcode?.source === 'photo' && (
+  <p className="font-mono text-xs text-amber-700">
+    Couldn't read the barcode — kept the photo. Try again with the pack flat and
+    the whole code in frame.
+  </p>
+)}
 
   const onPick = async (slot: Slot, file: File | undefined) => {
     if (!file) return
@@ -154,6 +202,23 @@ export default function CaptureScreen() {
       setConfirmNoPhotos(false)
     }
   }
+
+  // product photo — .jpg, as before
+await supabase.storage
+  .from('captures')
+  .upload(`${product.sku}/product.jpg`, processedProduct!, {
+    upsert: true,
+    contentType: 'image/jpeg',
+  })
+
+// barcode — now a PNG when scanned or generated (line art; JPEG ringing around
+// the bars is what makes scanners fail), JPEG only on the photo fallback
+const isPng = barcode!.source !== 'photo'
+const barcodePath = `${product.sku}/barcode.${isPng ? 'png' : 'jpg'}`
+await supabase.storage.from('captures').upload(barcodePath, barcode!.blob, {
+  upsert: true,
+  contentType: isPng ? 'image/png' : 'image/jpeg',
+})
 
   const deletePhoto = async (slot: Slot) => {
     if (saving) return
@@ -282,6 +347,21 @@ export default function CaptureScreen() {
           </section>
         )}
       </main>
+
+      <button
+  type="button"
+  onClick={async () => setBarcode(await generateBarcodeForSku(product.sku))}
+  className="font-mono text-xs underline text-ink/60"
+      >
+  No barcode on this pack — generate one
+      </button>
+      {
+  // ...what you already send...
+  barcode_value: barcode?.value ?? null,
+  barcode_format: barcode?.format ?? null,
+  barcode_source: barcode?.source ?? null,
+  product_photo_processed: !productWarning,
+}
 
       {/* Save bar — bottom nav is hidden on this screen so this is always fully visible */}
       <div className="fixed bottom-0 inset-x-0 z-40 bg-white border-t border-line p-4" style={{ paddingBottom: 'calc(env(safe-area-inset-bottom) + 16px)' }}>
