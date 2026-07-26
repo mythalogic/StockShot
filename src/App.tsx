@@ -9,6 +9,7 @@ import Progress from './pages/Progress'
 import SupplierDetail from './pages/SupplierDetail'
 import ExportPage from './pages/Export'
 import AdminImport from './pages/AdminImport'
+import { warmUpSegmenter } from './lib/segmentation'
 
 function Shell() {
   const { session, loading, isManager } = useAuth()
@@ -16,6 +17,10 @@ function Shell() {
   // Hide the bottom nav on the capture screen so the Save bar
   // is always fully visible and easy to press.
   const hideNav = location.pathname.startsWith('/capture/')
+
+  useEffect(() => {
+  if (session) void warmUpSegmenter().catch(() => {}) // best-effort; capture retries
+                  }, [session]) 
 
   if (loading) {
     return (
