@@ -23,6 +23,11 @@ export default defineConfig({
         ]
       },
       workbox: {
+        globPatterns: ['**/*.{js,css,html,ico,png,svg,woff2,onnx,wasm}'],
+        maximumFileSizeToCacheInBytes: 8 * 1024 * 1024, // u2netp.onnx is 4.7MB
+      },
+
+      workbox: {
         // App shell loads offline; API/storage calls still need connectivity.
         globPatterns: ['**/*.{js,css,html,png,svg,woff2}'],
         navigateFallback: '/index.html',
